@@ -154,12 +154,24 @@ class BacktestEngine:
                     if len(self.open_trades) < self.max_active_trades:
                         self._open_trade(ts, bar, params, risk_manager, current_capital, immediate=False)
 
-            # Detect new entries this bar
+            # --- DETECT NEW ENTRIES (this bar) ---
+            engine_state = {
+                "active_trades": len(self.open_trades),
+                "equity": current_capital,
+                "ts": ts
+            }
+
             new_signals = []
             for rule in (entry_rules or []):
-                hit, params = rule.check(ts, bar['close'], self.df)
+                # check() may or may not accept state
+                try:
+                    hit, params = rule.check(ts, bar['close'], self.df, state=engine_state)
+                except TypeError:
+                    # fallback for old rules
+                    hit, params = rule.check(ts, bar['close'], self.df)
                 if hit:
                     new_signals.append(params)
+
 
             # Queue or execute
             if self.entry_on_next_bar:

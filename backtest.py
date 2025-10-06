@@ -75,11 +75,15 @@ class BacktestEngine:
         else:
             return raw_price - adj if side == 1 else raw_price + adj
 
-    def _open_trade(self, ts, bar, params, risk_manager, current_capital, immediate=False):
+    def _open_trade(self, ts, bar, params, current_capital, immediate=False):
         """
-        Create and size a trade. Uses 'open' on next-bar entries by default,
-        otherwise 'close' for same-bar immediate entries (configurable above).
+        Create, size, and register a trade.
+        - Uses dynamic risk sizing if enabled.
+        - Applies TP if provided.
+        - Records entry equity for later PnL tracking.
         """
+        
+
         side = int(params["side"])
         price_field = "close" if immediate or not self.entry_on_next_bar else self.entry_fill
         raw_entry = self._bar_price(bar, price_field)
@@ -93,17 +97,36 @@ class BacktestEngine:
             planned_sl_pips=params.get("sl_pips"),
             strategy=params.get("strategy", "Custom"),
         )
+        # Attach entry rule metadata (confidence, filters, indicators)
+        trade.meta.update(params)
         trade.risk_pct = params.get("risk_pct", 1.0)
 
-        # Size with the *actual* entry price used
-        risk_manager.capital = current_capital
-        trade = risk_manager.assign_trade_params(trade)
-        if not trade.cancelled:
+        # --- Dynamic risk update (compounding) ---
+        if getattr(self, "dynamic_risk", False):
+            self.risk_manager.capital = current_capital
+
+        # --- Assign initial SL and position size ---
+        self.risk_manager.assign_trade_params(trade)
+        trade.initial_sl_price = trade.sl_price
+        trade.be_armed = False
+
+        # --- Optional take-profit setup ---
+        tp_pips = params.get("tp_pips")
+        if tp_pips is not None:
+            if trade.side == 1:
+                trade.tp_price = trade.entry_price + tp_pips * self.pair.pip_size
+            else:
+                trade.tp_price = trade.entry_price - tp_pips * self.pair.pip_size
+
+        # --- Register trade if valid ---
+        if not getattr(trade, "cancelled", False):
             trade.entry_equity = current_capital
             self.open_trades.append(trade)
 
+        return trade
+
     def _close_trade(self, trade, exit_time, raw_fill_price,
-                     current_capital, global_max_equity, total_fees_accum, wins):
+                     current_capital, global_max_equity, total_fees_accum, wins, reason=None):
         # Apply spread+slippage to exit
         exit_px = self._fill_adjust(float(raw_fill_price), trade.side, is_entry=False)
 
@@ -133,50 +156,80 @@ class BacktestEngine:
         # Drawdown snapshot
         global_max_equity = max(global_max_equity, current_capital)
         trade.drawdown = global_max_equity - current_capital
-
+        # NEW: reason
+        trade.exit_reason = reason or "Unknown"       
         # Log
         self.trades.append(trade)
 
         return current_capital, global_max_equity, total_fees_accum, wins
 
-    def _process_exits(self, ts, bar, current_capital, global_max_equity, total_fees_accum, wins, exit_rules):
+    def _process_exits(
+        self, ts, bar, current_capital, global_max_equity, total_fees_accum, wins, exit_rules, debug_mode=False):
+        """
+        Process exits for open trades.
+        - Collect all triggered exit levels each bar.
+        - Select the tightest (most conservative) one.
+        - Simplified and order-independent.
+        """
         if not self.open_trades:
-            return current_capital, global_max_equity, total_fees_accum, wins
+            return (current_capital, global_max_equity, total_fees_accum, wins,
+                    "hold" if debug_mode else None)
 
         still_open = []
-        for trade in self.open_trades:
-            closed = False
+        exit_reason = None
 
-            # Evaluate rules in given order; "first rule wins"
+        for trade in self.open_trades:
+            hits = []
+
+            # collect all triggered exits
             for rule in (exit_rules or []):
                 hit, raw_px = rule.update(trade, bar, ts)
                 if hit:
-                    current_capital, global_max_equity, total_fees_accum, wins = self._close_trade(
-                        trade, ts, raw_px, current_capital, global_max_equity, total_fees_accum, wins
-                    )
-                    closed = True
-                    break
+                    hits.append((raw_px, rule.__class__.__name__))
 
-            # Force-close on final bar if not closed by rules
-            if not closed:
-                if ts == self.df.index[-1]:
-                    raw_px = float(bar['close'])
-                    current_capital, global_max_equity, total_fees_accum, wins = self._close_trade(
-                        trade, ts, raw_px, current_capital, global_max_equity, total_fees_accum, wins
-                    )
+            if hits:
+                # pick the tightest one depending on trade side
+                if trade.side == 1:
+                    hit_level, hit_reason = min(hits, key=lambda x: x[0])  # lowest = tightest for long
                 else:
-                    still_open.append(trade)
+                    hit_level, hit_reason = max(hits, key=lambda x: x[0])  # highest = tightest for short
+
+                current_capital, global_max_equity, total_fees_accum, wins = self._close_trade(
+                    trade, ts, hit_level, current_capital,
+                    global_max_equity, total_fees_accum, wins,
+                    reason=hit_reason
+                )
+                exit_reason = hit_reason
+
+            elif ts == self.df.index[-1]:
+                # force close at last bar
+                raw_px = float(bar["close"])
+                exit_reason = "ForcedClose_EndOfData"
+                current_capital, global_max_equity, total_fees_accum, wins = self._close_trade(
+                    trade, ts, raw_px, current_capital,
+                    global_max_equity, total_fees_accum, wins,
+                    reason=exit_reason
+                )
+            else:
+                still_open.append(trade)
 
         self.open_trades = still_open
-        return current_capital, global_max_equity, total_fees_accum, wins
+
+        if debug_mode:
+            return current_capital, global_max_equity, total_fees_accum, wins, exit_reason
+        else:
+            return current_capital, global_max_equity, total_fees_accum, wins
+
 
     # ---------- main run ----------
 
-    def run(self, initial_capital=1000, entry_rules=None, exit_rules=None):
+    def run(self, initial_capital=1000, entry_rules=None, exit_rules=None, debug_mode=False):
+        self._exit_rules = exit_rules or []
         current_capital = float(initial_capital)
-        risk_manager = RiskManager(capital=current_capital, currency_pair=self.pair)
+        self.risk_manager = RiskManager(capital=current_capital, currency_pair=self.pair)
         global_max_equity, wins, total_fees = float(initial_capital), 0, 0.0
-
+        debug_rows = [] if debug_mode else None
+        rule_levels_log = [] if debug_mode else None
         for ts, row in self.df.iterrows():
             # build a dict-like bar with expected keys
             bar = {
@@ -188,10 +241,9 @@ class BacktestEngine:
 
             # --- EXITS FIRST (recommended) ---
             if self.exit_first:
-                current_capital, global_max_equity, total_fees, wins = self._process_exits(
-                    ts, bar, current_capital, global_max_equity, total_fees, wins, exit_rules
-                )
-
+                current_capital, global_max_equity, total_fees, wins, exit_reason = self._process_exits(
+                    ts, bar, current_capital, global_max_equity, total_fees, wins, exit_rules,debug_mode)
+            
             # --- OPEN PENDING ENTRIES (from previous bar) ---
             if self.entry_on_next_bar and self._pending_entries:
                 # fill pending at configured entry_fill (usually 'open') of *this* bar
@@ -199,14 +251,26 @@ class BacktestEngine:
                 self._pending_entries = []
                 for params in pendings:
                     if len(self.open_trades) < self.max_active_trades:
-                        self._open_trade(ts, bar, params, risk_manager, current_capital, immediate=False)
+                        self._open_trade(ts, bar, params, current_capital, immediate=False)
 
             # --- DETECT NEW ENTRIES (this bar) ---
+            engine_state = {
+                "active_trades": len(self.open_trades),
+                "equity": current_capital,
+                "ts": ts
+            }
+
             new_signals = []
             for rule in (entry_rules or []):
-                hit, params = rule.check(ts, bar['close'], self.df)
+                # check() may or may not accept state
+                try:
+                    hit, params = rule.check(ts, bar['close'], self.df, state=engine_state)
+                except TypeError:
+                    # fallback for old rules
+                    hit, params = rule.check(ts, bar['close'], self.df)
                 if hit:
                     new_signals.append(params)
+
 
             # Queue or execute
             if self.entry_on_next_bar:
@@ -214,21 +278,61 @@ class BacktestEngine:
             else:
                 for params in new_signals:
                     if len(self.open_trades) < self.max_active_trades:
-                        self._open_trade(ts, bar, params, risk_manager, current_capital, immediate=True)
+                        trade = self._open_trade(ts, bar, params, current_capital, immediate=True)
 
             # --- EXITS SECOND (if configured) ---
             if not self.exit_first:
-                current_capital, global_max_equity, total_fees, wins = self._process_exits(
-                    ts, bar, current_capital, global_max_equity, total_fees, wins, exit_rules
+                current_capital, global_max_equity, total_fees, wins, exit_reason = self._process_exits(
+                    ts, bar, current_capital, global_max_equity, total_fees, wins, exit_rules, debug_mode
                 )
-
             # --- EQUITY TRACK ---
             self.equity_curve.loc[ts] = current_capital
             self.drawdown_series.loc[ts] = global_max_equity - current_capital
+            # --- per-bar log ---
+            if debug_mode:
+                row = {
+                    "time": ts, **bar,
+                    "equity": current_capital,
+                    "drawdown": global_max_equity - current_capital,
+                    "open_trades": len(self.open_trades),
+                    "pending": len(self._pending_entries),
+                    "exit_reason": exit_reason,
+                }
+
+                if self.open_trades:
+                    trade = self.open_trades[0]
+                    # Collect candidate SLs with color/style hints for plotting later
+                    for rule in exit_rules:
+                        name = rule.__class__.__name__
+                        sl_val = rule.candidate_sl(trade, bar, ts)
+                        row[name] = sl_val
+                        # Optional: mark phase info if ProgressiveStop
+                        if name == "ProgressiveStop":
+                            phase = (
+                                "Fixed" if not getattr(trade, "breakeven_armed", False)
+                                else "Trailing" if sl_val != trade.entry_price
+                                else "Breakeven"
+                            )
+                            row[f"{name}_phase"] = phase
+                    # always log final active SL
+                    row["sl_price"] = trade.sl_price
+
+
+                debug_rows.append(row)
 
         # note: any _pending_entries after the last bar won't execute (no next bar)
         self._finalize_metrics(initial_capital, current_capital, wins, total_fees)
-
+        if debug_mode:
+            df_main = pd.DataFrame(debug_rows)
+            df_rules = pd.DataFrame(rule_levels_log) if rule_levels_log else pd.DataFrame()
+            if not df_rules.empty:
+                df_debug = pd.merge(df_main, df_rules, on="time", how="left")
+            else:
+                df_debug = df_main
+            return df_debug, self.trades
+        else:
+            return self.metrics
+        
     def _finalize_metrics(self, initial_capital, current_capital, wins, total_fees):
         self.metrics['cumulative_pnl'] = current_capital - initial_capital
         self.metrics['max_drawdown'] = float(self.drawdown_series.max()) if len(self.drawdown_series) else 0.0
@@ -254,3 +358,4 @@ def filter_strategies(df, min_pnl_pct=5, max_dd_pct=10, initial_capital=1000):
     min_pnl = initial_capital * (min_pnl_pct / 100)
     max_dd = initial_capital * (max_dd_pct / 100)
     return df[(df['cumulative_pnl'] >= min_pnl) & (df['max_drawdown'] <= max_dd)]
+

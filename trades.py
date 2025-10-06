@@ -19,10 +19,16 @@ class Trade:
         self.cancelled = False
         self.entry_equity = None
         self.exit_equity = None
-        self.intraday_equity = []
         self.total_fees = 0.0
+        self.exit_reason = None
+        self.be_armed = False
+        self.initial_sl_price = None
 
-
+        # --- NEW ---
+        # flexible per-trade metadata (strategy-specific info)
+        self.meta = {
+            "intraday_equity": []
+        }
 class Fees:
     def __init__(self, commission=0.0, overnight_fee=0.0, swap_fee=0.0):
         self.commission = commission

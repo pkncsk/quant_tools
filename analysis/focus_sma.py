@@ -1,10 +1,15 @@
 #%%
-from datetime import datetime, timedelta
+#%% focus_sma_confirm.py
+from datetime import datetime
 import os, sys
 import pandas as pd
-import matplotlib.pyplot as plt
 import pytz
+import matplotlib.pyplot as plt
+
+# --- Dev path ---
 sys.path.append(os.path.abspath("D:/coding/quant/dev"))
+
+# Package imports
 from quant_tools import fetch_fx, CurrencyPair, Fees
 from quant_tools.backtest import BacktestEngine
 from quant_tools.exits import FixedStop, TrailingStop, BreakEvenStepStop
@@ -16,76 +21,119 @@ START = BANGKOK.localize(datetime(2025, 1, 1))
 END   = BANGKOK.localize(datetime(2025, 3, 31))
 INITIAL_CAPITAL = 1000.0
 
-
-
-FAST, SLOW, SL_PIPS, RISK_PCT = 14, 30, 70, 1.0
+FAST, SLOW, MID, SL_PIPS, RISK_PCT = 14, 30, 100, 70, 1.0
 WARMUP_BARS = 250
-BAR_INTERVAL_MIN = 5   # fetch_fx default
 
-# --- Calculate offset date from warmup ---
-bars_per_day = int((24 * 60) / BAR_INTERVAL_MIN)  # e.g. 288 for M5
+# --- Warmup offset ---
+BAR_INTERVAL_MIN = 5
+bars_per_day = int((24 * 60) / BAR_INTERVAL_MIN)
 offset_days = (WARMUP_BARS // bars_per_day) + 1
 DATA_START = START - pd.Timedelta(days=offset_days)
-
+import dukascopy_python
 pair = CurrencyPair(SYMBOL, pip_size=0.01, contract_size=100_000)
 fees = Fees(commission=0.5, overnight_fee=0.01, swap_fee=0.0)
-df = fetch_fx(pair.symbol, start=DATA_START, end=END)
+df = fetch_fx(pair.symbol, start=DATA_START, end=END, interval=dukascopy_python.INTERVAL_MIN_10)
 
-class SMAEntrySlope:
-    def __init__(self, df, fast, slow, risk_pct=1.0, sl_pips=50, strategy="SMA_Slope"):
-        if slow < fast + 4:
-            raise ValueError("Require slow ≥ fast+4")
-        self.strategy = strategy
-        self.risk_pct = float(risk_pct)
-        self.sl_pips  = int(sl_pips)
+
+# --- Entry rule class ---
+class SMAEntryConfirm:
+    def __init__(self, df, fast=14, slow=30, mid=100,
+                 risk_pct=1.0, sl_pips=50, strategy="SMA_Confirm",
+                 max_wait=10):
+        self.df = df
         self.fast_sma = df["close"].rolling(fast).mean()
         self.slow_sma = df["close"].rolling(slow).mean()
-        self.trend_sma = df["close"].rolling(200).mean()
+        self.mid_sma  = df["close"].rolling(mid).mean()
         self.index = df.index
+        self.pending = None
+        self.strategy = strategy
+        self.risk_pct = risk_pct
+        self.sl_pips = sl_pips
+        self.max_wait = max_wait   # expire pending if too old
 
-    def check(self, ts, price, df):
+    def check(self, ts, price, df, state=None):
+        """Return (hit, params) if entry confirmed."""
         i = self.index.get_loc(ts)
-        if ts < START or i < WARMUP_BARS:   # ensure warmup
-            return False, {}
-        f_now, s_now = self.fast_sma.iloc[i], self.slow_sma.iloc[i]
+        f, s, m = self.fast_sma.iloc[i], self.slow_sma.iloc[i], self.mid_sma.iloc[i]
         f_prev, s_prev = self.fast_sma.iloc[i-1], self.slow_sma.iloc[i-1]
-        t_now, t_prev = self.trend_sma.iloc[i], self.trend_sma.iloc[i-1]
-        if any(pd.isna(x) for x in [f_now, s_now, f_prev, s_prev, t_now, t_prev]):
+        m_prev = self.mid_sma.iloc[i-1]
+
+        # Skip if warmup not finished
+        if i < WARMUP_BARS or ts < START:
             return False, {}
-        slope_up, slope_down = (t_now > t_prev), (t_now < t_prev)
-        cross_up = (f_now > s_now) and (f_prev <= s_prev) and slope_up
-        cross_dn = (f_now < s_now) and (f_prev >= s_prev) and slope_down
-        if cross_up:
-            return True, {"side": +1, "strategy": self.strategy,
-                          "risk_pct": self.risk_pct, "sl_pips": self.sl_pips}
-        if cross_dn:
-            return True, {"side": -1, "strategy": self.strategy,
-                          "risk_pct": self.risk_pct, "sl_pips": self.sl_pips}
+
+        # --- Step 1: Detect new fast/slow cross (overwrite pending) ---
+        if f > s and f_prev <= s_prev:
+            self.pending = {"side": +1, "bar": i}
+        elif f < s and f_prev >= s_prev:
+            self.pending = {"side": -1, "bar": i}
+
+        # --- Step 2a: Expire stale pending ---
+        if self.pending and self.max_wait is not None:
+            if i - self.pending["bar"] > self.max_wait:
+                self.pending = None
+
+        # --- Step 2b: Confirm only if flat ---
+        if self.pending and state and state.get("active_trades", 0) == 0:
+            side = self.pending["side"]
+
+            if side == +1:
+                # Confirm long if fast or slow crosses SMA100 upward
+                if f > m and f_prev <= m_prev:
+                    self.pending = None
+                    return True, {"side": +1, "strategy": self.strategy,
+                                  "risk_pct": self.risk_pct, "sl_pips": self.sl_pips}
+                if s > m and s_prev <= m_prev:
+                    self.pending = None
+                    return True, {"side": +1, "strategy": self.strategy,
+                                  "risk_pct": self.risk_pct, "sl_pips": self.sl_pips}
+
+            elif side == -1:
+                # Confirm short if fast or slow crosses SMA100 downward
+                if f < m and f_prev >= m_prev:
+                    self.pending = None
+                    return True, {"side": -1, "strategy": self.strategy,
+                                  "risk_pct": self.risk_pct, "sl_pips": self.sl_pips}
+                if s < m and s_prev >= m_prev:
+                    self.pending = None
+                    return True, {"side": -1, "strategy": self.strategy,
+                                  "risk_pct": self.risk_pct, "sl_pips": self.sl_pips}
+
         return False, {}
 
-# --- Setup ---
-entry = SMAEntrySlope(df, FAST, SLOW, risk_pct=RISK_PCT, sl_pips=SL_PIPS)
+
+
+
+# --- Setup exits ---
 exit_rules = [
     FixedStop(sl_pips=70, pip_size=pair.pip_size),
-    TrailingStop(trail_pips=30, pip_size=pair.pip_size),
-    BreakEvenStepStop(trigger_pips=20, step_pips=10, pip_size=pair.pip_size,
+    BreakEvenStepStop(trigger_pips=70, step_pips=
+                      30, pip_size=pair.pip_size,
                       commission=fees.commission, overnight_fee=fees.overnight_fee),
+    TrailingStop(trail_pips=30, pip_size=pair.pip_size),
+    
 ]
 
+# --- Backtest ---
 engine = BacktestEngine(df, pair, fees,
                         max_active_trades=1,
                         spread_pips=0.5,
                         slippage_pips=0.1)
-engine.run(initial_capital=INITIAL_CAPITAL, entry_rules=[entry], exit_rules=exit_rules)
+entry_rule = SMAEntryConfirm(df, FAST, SLOW, MID, risk_pct=RISK_PCT, sl_pips=SL_PIPS)
+engine.run(initial_capital=INITIAL_CAPITAL, entry_rules=[entry_rule], exit_rules=exit_rules)
 
-# --- Results
+# --- Results ---
 trade_log = pd.DataFrame([{
     "Entry Time": t.entry_time, "Exit Time": t.exit_time,
     "Side": ("Long" if t.side == 1 else "Short"),
     "Entry Price": t.entry_price, "Exit Price": t.exit_price,
-    "PnL": t.pnl, "Win": t.win
+    "PnL": t.pnl, "Win": t.win,
+    "Exit Reason": t.exit_reason 
 } for t in engine.trades])
 print(trade_log)
+
+print("Metrics:", engine.metrics)
+
 #%%
 import matplotlib.ticker as mticker
 
@@ -101,6 +149,8 @@ plt.plot(days, eq_curve, label="Equity Curve")
 plt.fill_between(days, eq_curve - dd_curve, eq_curve,
                  alpha=0.3, label="Drawdown")
 plt.xlabel("Day")
+plt.ylabel("Equity")
+
 # Add ticks every 5 days (weekly spacing)
 ax = plt.gca()
 ax.xaxis.set_major_locator(mticker.MultipleLocator(5))
@@ -150,8 +200,8 @@ fig.add_trace(go.Scatter(
 ), row=1, col=1)
 
 fig.add_trace(go.Scatter(
-    x=df.index, y=df['close'].rolling(200).mean(),
-    mode="lines", name="SMA 200",
+    x=df.index, y=df['close'].rolling(100).mean(),
+    mode="lines", name="SMA 100",
     line=dict(color="gold", dash="dot")
 ), row=1, col=1)
 
@@ -283,3 +333,26 @@ fig.update_layout(
 
 fig.show()
 
+# %%
+# Count trades by exit reason
+trade_log["Exit Reason"].value_counts()
+
+# Percentage breakdown
+trade_log["Exit Reason"].value_counts(normalize=True) * 100
+
+# Average PnL by exit reason
+trade_log.groupby("Exit Reason")["PnL"].mean()
+
+# Median PnL by exit reason
+trade_log.groupby("Exit Reason")["PnL"].median()
+
+# Distribution (count + mean + win rate) by exit reason
+summary = trade_log.groupby("Exit Reason").agg(
+    Trades=("PnL", "count"),
+    AvgPnL=("PnL", "mean"),
+    MedianPnL=("PnL", "median"),
+    WinRate=("Win", "mean")
+)
+print(summary)
+
+# %%
